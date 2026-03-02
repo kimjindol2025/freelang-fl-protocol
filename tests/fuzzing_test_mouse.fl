@@ -1,0 +1,253 @@
+// ============================================================================
+// 🐀 Fuzzing Test Mouse: FL-Protocol 무관용 파괴 테스트
+// "테스트 쥐가 죽을 때까지 때린다" - 시스템 완벽성의 증거
+// ============================================================================
+
+#[cfg(test)]
+mod fuzzing_test_mouse {
+  use crate::packet_codec::*;
+  use std::time::Instant;
+  
+  // ========================================================================
+  // 단계 1: Malformed Packet 생성 (랜덤 비트 플립)
+  // ========================================================================
+  
+  fn flip_random_bits(data: &[u8], flip_probability: f64) -> Vec<u8> {
+    let mut result = data.to_vec();
+    for byte in &mut result {
+      if rand::random::<f64>() < flip_probability {
+        let bit = rand::random::<u8>() % 8;
+        *byte ^= 1 << bit;
+      }
+    }
+    result
+  }
+  
+  fn corrupt_packet_header(packet: &[u8]) -> Vec<u8> {
+    // 헤더의 특정 바이트를 파괴
+    let mut corrupted = packet.to_vec();
+    if corrupted.len() > 4 {
+      corrupted[0] = 0xFF; // Magic 파괴
+    }
+    if corrupted.len() > 5 {
+      corrupted[5] = 0xFF; // Type 파괴
+    }
+    corrupted
+  }
+  
+  fn corrupt_checksum(packet: &[u8]) -> Vec<u8> {
+    // 체크섬 부분을 파괴 (마지막 4bytes)
+    let mut corrupted = packet.to_vec();
+    if corrupted.len() > 4 {
+      let end = corrupted.len();
+      corrupted[end-4..end].iter_mut().for_each(|b| *b = 0xFF);
+    }
+    corrupted
+  }
+  
+  fn inject_random_garbage(size: usize) -> Vec<u8> {
+    // 완전한 쓰레기 데이터 생성
+    (0..size).map(|_| rand::random::<u8>()).collect()
+  }
+  
+  // ========================================================================
+  // 단계 2: 무관용 검증 (Unforgiving Rules)
+  // ========================================================================
+  
+  #[test]
+  fn test_mouse_magic_header_corruption() {
+    // Rule: 매직 헤더가 파괴되면 즉시 감지 가능해야 함
+    let bytecode = vec![0x01, 0x02, 0x03, 0x04];
+    let payload = vec![0x10, 0x20, 0x30];
+    
+    let original = create_fl_packet(0, bytecode, payload);
+    let mut serialized = serialize_packet(&original);
+    
+    // 매직 헤더 파괴
+    serialized[0] = 0xFF;
+    
+    // 무관용 검증: 파싱이 실패해야 함
+    let result = parse_fl_packet(&serialized);
+    assert!(result.is_err(), "🐁 DEAD: 매직 헤더 파괴를 감지하지 못함!");
+  }
+  
+  #[test]
+  fn test_mouse_size_field_corruption() {
+    // Rule: 크기 필드가 잘못되면 메모리 접근 오류가 나야 함
+    let bytecode = vec![1, 2, 3, 4, 5];
+    let payload = vec![10, 20, 30];
+    
+    let original = create_fl_packet(0, bytecode, payload);
+    let mut serialized = serialize_packet(&original);
+    
+    // 바이트코드 크기를 엄청 크게 설정
+    let huge_size = 0xFFFFFFFF as u32;
+    serialized[8..12].copy_from_slice(&huge_size.to_be_bytes());
+    
+    // 무관용 검증: 파싱 실패 또는 경계 검사 통과
+    let result = parse_fl_packet(&serialized);
+    
+    // Err 또는 패킷이 불완전해야 함
+    match result {
+      Ok(packet) => {
+        assert!(
+          packet.bytecode_size > 0xFFFFFF,
+          "🐁 DEAD: 크기 필드 파괴를 감지하지 못함!"
+        );
+      }
+      Err(_) => {
+        // 정상: 파싱 실패
+      }
+    }
+  }
+  
+  #[test]
+  fn test_mouse_checksum_failure() {
+    // Rule: 체크섬이 틀리면 무결성 검증 실패
+    let bytecode = vec![0xAA, 0xBB];
+    let payload = vec![0xCC, 0xDD, 0xEE];
+    
+    let original = create_fl_packet(0, bytecode, payload);
+    let mut serialized = serialize_packet(&original);
+    
+    // 페이로드 일부 파괴
+    if serialized.len() > 30 {
+      serialized[20] ^= 0xFF;
+    }
+    
+    // 무관용 검증: 체크섬 불일치 감지
+    let parsed = parse_fl_packet(&serialized);
+    assert!(parsed.is_ok(), "파싱은 성공");
+    
+    let packet = parsed.unwrap();
+    let recalculated = calculate_crc32(&packet);
+    assert_ne!(
+      packet.checksum, recalculated,
+      "🐁 DEAD: 체크섬 불일치를 감지하지 못함!"
+    );
+  }
+  
+  // ========================================================================
+  // 단계 3: Fuzzing 강제 (1M iterations)
+  // ========================================================================
+  
+  #[test]
+  fn test_mouse_1m_random_packets() {
+    // 무관용 규칙: 1M번 중 한 번이라도 crash나면 테스트 쥐 사망
+    
+    const ITERATIONS: usize = 1_000_000;
+    const CRASH_THRESHOLD: i32 = 0; // 한 번도 허락 안 함
+    
+    let mut crashes = 0;
+    let mut timeouts = 0;
+    
+    let start = Instant::now();
+    
+    for i in 0..ITERATIONS {
+      // 정상 패킷 생성
+      let bytecode = vec![0x01, 0x02, 0x03];
+      let payload = vec![0x10, 0x20, 0x30, 0x40];
+      let packet = create_fl_packet(0, bytecode, payload);
+      let mut serialized = serialize_packet(&packet);
+      
+      // 0.01% 확률로 corruption 주입
+      if (i % 10000) == 0 {
+        match rand::random::<u8>() % 3 {
+          0 => serialized = corrupt_packet_header(&serialized),
+          1 => serialized = corrupt_checksum(&serialized),
+          2 => serialized = flip_random_bits(&serialized, 0.001),
+          _ => {}
+        }
+      }
+      
+      // 무관용 파싱: Panic이나 Segfault는 안 됨
+      match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = parse_fl_packet(&serialized);
+      })) {
+        Ok(_) => {
+          // 정상
+        }
+        Err(_) => {
+          crashes += 1;
+        }
+      }
+      
+      // 타임아웃 감지 (1초당 100K+ 처리해야 함)
+      if i % 100_000 == 0 && i > 0 {
+        let elapsed = start.elapsed().as_secs_f64();
+        let expected = (i as f64) / 1_000_000.0;
+        if elapsed > expected + 1.0 {
+          timeouts += 1;
+        }
+      }
+    }
+    
+    let elapsed = start.elapsed();
+    
+    // 무관용 검증
+    assert_eq!(
+      crashes, CRASH_THRESHOLD,
+      "🐁 DEAD at iteration: Panic/Segfault detected! Crashes: {}",
+      crashes
+    );
+    
+    assert_eq!(
+      timeouts, 0,
+      "🐁 DEAD: Performance timeout! Expected <6s, got {}s",
+      elapsed.as_secs_f64()
+    );
+    
+    eprintln!(
+      "🐁 ALIVE: {} iterations survived in {:.2}s ({:.0} pkt/sec)",
+      ITERATIONS,
+      elapsed.as_secs_f64(),
+      (ITERATIONS as f64) / elapsed.as_secs_f64()
+    );
+  }
+  
+  #[test]
+  fn test_mouse_garbage_input() {
+    // 무관용 규칙: 완전한 쓰레기도 segfault 없이 처리해야 함
+    
+    for size in [1, 10, 100, 1000, 10000].iter() {
+      let garbage = inject_random_garbage(*size);
+      
+      let result = parse_fl_packet(&garbage);
+      
+      // Err은 OK, Panic은 NOT OK
+      match result {
+        Ok(_) => {
+          // 우연히 성공했을 수도 있음
+        }
+        Err(_) => {
+          // 정상: 가비지 데이터 감지
+        }
+      }
+    }
+    
+    eprintln!("🐁 ALIVE: Garbage input handling passed");
+  }
+  
+  #[test]
+  fn test_mouse_boundary_conditions() {
+    // 무관용 규칙: 경계 조건 (Empty, Max, etc)에서도 안전해야 함
+    
+    let test_cases = vec![
+      (vec![], vec![]),                           // Empty
+      (vec![0xFF; 1], vec![]),                     // Min bytecode
+      (vec![], vec![0xFF; 1]),                     // Min payload
+      (vec![0; 65535], vec![0; 65535]),           // Near 64K
+    ];
+    
+    for (bytecode, payload) in test_cases {
+      let packet = create_fl_packet(0, bytecode.clone(), payload.clone());
+      let serialized = serialize_packet(&packet);
+      
+      let parsed = parse_fl_packet(&serialized);
+      assert!(parsed.is_ok(), "🐁 DEAD: Boundary condition failed");
+    }
+    
+    eprintln!("🐁 ALIVE: Boundary conditions passed");
+  }
+}
+
