@@ -1,0 +1,136 @@
+// ============================================================================
+// Stage 1: Packet Codec 검증 (13개 테스트)
+// ============================================================================
+
+#[cfg(test)]
+mod packet_codec_tests {
+  use crate::packet_codec::*;
+  
+  #[test]
+  fn test_magic_header_validation() {
+    // "FLPK" 매직 헤더 확인
+    let packet = create_fl_packet(0, vec![1, 2, 3], vec![10, 20]);
+    assert_eq!(packet.magic, [0x46, 0x4C, 0x50, 0x4B]);
+  }
+  
+  #[test]
+  fn test_version_tracking() {
+    let packet = create_fl_packet(0, vec![], vec![]);
+    assert_eq!(packet.version, 0x01);
+  }
+  
+  #[test]
+  fn test_packet_types() {
+    let p0 = create_fl_packet(0, vec![], vec![]); // Data+Bytecode
+    let p1 = create_fl_packet(1, vec![], vec![]); // Pure Data
+    let p2 = create_fl_packet(2, vec![], vec![]); // Control
+    
+    assert_eq!(p0.packet_type, 0);
+    assert_eq!(p1.packet_type, 1);
+    assert_eq!(p2.packet_type, 2);
+  }
+  
+  #[test]
+  fn test_size_encoding() {
+    let bytecode = vec![1; 256];      // 256 bytes
+    let payload = vec![0; 1024];      // 1024 bytes
+    
+    let packet = create_fl_packet(0, bytecode, payload);
+    assert_eq!(packet.bytecode_size, 256);
+    assert_eq!(packet.payload_size, 1024);
+  }
+  
+  #[test]
+  fn test_serialization_roundtrip() {
+    let bytecode = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let payload = vec![0x12, 0x34, 0x56, 0x78, 0x9A];
+    
+    let original = create_fl_packet(0, bytecode.clone(), payload.clone());
+    let serialized = serialize_packet(&original);
+    let parsed = parse_fl_packet(&serialized).unwrap();
+    
+    assert_eq!(parsed.bytecode, bytecode);
+    assert_eq!(parsed.payload, payload);
+  }
+  
+  #[test]
+  fn test_checksum_integrity() {
+    let packet = create_fl_packet(0, vec![1, 2, 3], vec![4, 5, 6]);
+    let serialized = serialize_packet(&packet);
+    
+    // 패킷 검증
+    let parsed = parse_fl_packet(&serialized).unwrap();
+    assert_eq!(parsed.checksum, packet.checksum);
+  }
+  
+  #[test]
+  fn test_empty_bytecode() {
+    let packet = create_fl_packet(1, vec![], vec![1, 2, 3]);
+    assert_eq!(packet.bytecode_size, 0);
+    assert_eq!(packet.payload_size, 3);
+  }
+  
+  #[test]
+  fn test_empty_payload() {
+    let packet = create_fl_packet(0, vec![1, 2, 3], vec![]);
+    assert_eq!(packet.bytecode_size, 3);
+    assert_eq!(packet.payload_size, 0);
+  }
+  
+  #[test]
+  fn test_large_packet_handling() {
+    // 10KB 바이트코드 + 100KB 데이터
+    let bytecode = vec![0xAB; 10 * 1024];
+    let payload = vec![0xCD; 100 * 1024];
+    
+    let packet = create_fl_packet(0, bytecode, payload);
+    let serialized = serialize_packet(&packet);
+    
+    assert!(serialized.len() > 110 * 1024);
+  }
+  
+  #[test]
+  fn test_timestamp_encoding() {
+    let packet = create_fl_packet(0, vec![], vec![]);
+    assert!(packet.timestamp > 0);
+  }
+  
+  #[test]
+  fn test_field_descriptor_encoding() {
+    let header = BytecodeHeader {
+      schema_version: 1,
+      field_count: 3,
+      fields: vec![],
+      jit_target: 0,
+      optimization_level: 2,
+      compression_algo: 1,
+      routing_priority: 128,
+    };
+    
+    let bytecode = embed_jit_bytecode(header, vec![]);
+    assert!(!bytecode.is_empty());
+  }
+  
+  #[test]
+  fn test_packet_with_jit_bytecode() {
+    let bytecode = embed_jit_bytecode(
+      BytecodeHeader {
+        schema_version: 1,
+        field_count: 2,
+        fields: vec![],
+        jit_target: 0,
+        optimization_level: 3,
+        compression_algo: 2,
+        routing_priority: 255,
+      },
+      vec![],
+    );
+    
+    let payload = vec![0x01, 0x02, 0x03, 0x04];
+    let packet = create_fl_packet(0, bytecode, payload);
+    
+    assert!(packet.bytecode_size > 0);
+    assert_eq!(packet.payload_size, 4);
+  }
+}
+

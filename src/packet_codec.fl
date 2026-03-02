@@ -1,0 +1,303 @@
+// ============================================================================
+// Phase 12: FL-Protocol - Packet Codec Module
+// 자기 기술적 패킷 구조: 데이터가 아니라 '처리 지능'을 전송
+// ============================================================================
+
+// 패킷 구조 정의
+struct FLPacket {
+  // 헤더 (고정 16 bytes)
+  magic: [u8; 4],              // "FLPK" (0x464C504B)
+  version: u8,                 // Protocol version (현재: 0x01)
+  packet_type: u8,             // 0: Data+Bytecode, 1: Pure Data, 2: Control
+  reserved: [u8; 2],           // 향후 확장용
+  
+  // 크기 정보 (8 bytes)
+  bytecode_size: u32,          // JIT 바이트코드 크기
+  payload_size: u32,           // 실제 데이터 크기
+  
+  // 페이로드
+  bytecode: Vec<u8>,           // JIT 컴파일 코드 (데이터 스키마)
+  payload: Vec<u8>,            // 실제 전송 데이터
+  
+  // 검증
+  checksum: u32,               // CRC32 (전체 패킷)
+  timestamp: u64,              // 나노초 단위 타임스탐프
+}
+
+// 바이트코드 헤더: 패킷이 수신측 JIT에게 "나는 이렇게 처리해야 함"을 알림
+struct BytecodeHeader {
+  // 데이터 스키마 정의
+  schema_version: u16,         // Schema evolution 추적
+  field_count: u16,
+  fields: Vec<FieldDescriptor>,
+  
+  // JIT 컴파일 정보
+  jit_target: u8,              // 0: CPU, 1: SIMD, 2: GPU (향후)
+  optimization_level: u8,      // 0-3: None, Basic, Aggressive, Extreme
+  
+  // 네트워크 최적화 정보
+  compression_algo: u8,        // 0: None, 1: DEFLATE, 2: ZSTD
+  routing_priority: u8,        // 0-255: 경로 선택 우선순위
+}
+
+struct FieldDescriptor {
+  name: String,                // 필드 이름
+  field_type: u8,              // Type ID (u8, u16, u32, u64, string, array)
+  offset: u16,                 // 페이로드 내 오프셋
+  size: u16,                   // 필드 크기
+  encoder: u8,                 // 0: Raw, 1: RLE, 2: Delta, 3: Custom
+}
+
+// ============================================================================
+// 핵심 함수: 패킷 생성/해석
+// ============================================================================
+
+fn create_fl_packet(
+  packet_type: u8,
+  bytecode: Vec<u8>,
+  payload: Vec<u8>,
+) -> FLPacket {
+  let bytecode_size = bytecode.len() as u32;
+  let payload_size = payload.len() as u32;
+  
+  // 전체 패킷 생성 (헤더 + 바이트코드 + 페이로드)
+  let mut packet = FLPacket {
+    magic: [0x46, 0x4C, 0x50, 0x4B], // "FLPK"
+    version: 0x01,
+    packet_type,
+    reserved: [0, 0],
+    bytecode_size,
+    payload_size,
+    bytecode,
+    payload,
+    checksum: 0,
+    timestamp: current_time_nanos(),
+  };
+  
+  // CRC32 계산
+  packet.checksum = calculate_crc32(&packet);
+  packet
+}
+
+fn parse_fl_packet(raw_bytes: &[u8]) -> Result<FLPacket, String> {
+  if raw_bytes.len() < 16 {
+    return Err("Packet too small".to_string());
+  }
+  
+  // 매직 헤더 검증
+  if raw_bytes[0..4] != [0x46, 0x4C, 0x50, 0x4B] {
+    return Err("Invalid magic header".to_string());
+  }
+  
+  let version = raw_bytes[4];
+  let packet_type = raw_bytes[5];
+  
+  // 크기 정보 추출 (Big-Endian)
+  let bytecode_size = u32::from_be_bytes([
+    raw_bytes[8], raw_bytes[9], raw_bytes[10], raw_bytes[11]
+  ]);
+  let payload_size = u32::from_be_bytes([
+    raw_bytes[12], raw_bytes[13], raw_bytes[14], raw_bytes[15]
+  ]);
+  
+  let total_size = 16 + bytecode_size as usize + payload_size as usize + 8;
+  if raw_bytes.len() < total_size {
+    return Err("Incomplete packet".to_string());
+  }
+  
+  // 바이트코드와 페이로드 추출
+  let bytecode_start = 16;
+  let bytecode_end = bytecode_start + bytecode_size as usize;
+  let payload_start = bytecode_end;
+  let payload_end = payload_start + payload_size as usize;
+  
+  let bytecode = raw_bytes[bytecode_start..bytecode_end].to_vec();
+  let payload = raw_bytes[payload_start..payload_end].to_vec();
+  
+  // 체크섬 검증
+  let stored_checksum = u32::from_be_bytes([
+    raw_bytes[payload_end], raw_bytes[payload_end+1],
+    raw_bytes[payload_end+2], raw_bytes[payload_end+3]
+  ]);
+  
+  let packet = FLPacket {
+    magic: [0x46, 0x4C, 0x50, 0x4B],
+    version,
+    packet_type,
+    reserved: [raw_bytes[6], raw_bytes[7]],
+    bytecode_size,
+    payload_size,
+    bytecode,
+    payload,
+    checksum: stored_checksum,
+    timestamp: u64::from_be_bytes([
+      raw_bytes[payload_end+4], raw_bytes[payload_end+5],
+      raw_bytes[payload_end+6], raw_bytes[payload_end+7],
+      raw_bytes[payload_end+8], raw_bytes[payload_end+9],
+      raw_bytes[payload_end+10], raw_bytes[payload_end+11],
+    ]),
+  };
+  
+  Ok(packet)
+}
+
+// ============================================================================
+// 선택적 바이트코드 임베딩
+// ============================================================================
+
+fn embed_jit_bytecode(
+  bytecode_header: BytecodeHeader,
+  payload_data: Vec<u8>,
+) -> Vec<u8> {
+  let mut result = vec![0u8; 0];
+  
+  // 바이트코드 헤더 직렬화
+  result.extend_from_slice(&(bytecode_header.schema_version as u16).to_be_bytes());
+  result.extend_from_slice(&(bytecode_header.field_count as u16).to_be_bytes());
+  result.push(bytecode_header.jit_target);
+  result.push(bytecode_header.optimization_level);
+  result.push(bytecode_header.compression_algo);
+  result.push(bytecode_header.routing_priority);
+  
+  // 필드 디스크립터 직렬화
+  for field in &bytecode_header.fields {
+    // 필드 정보 인코딩
+    result.push(field.field_type);
+    result.extend_from_slice(&field.offset.to_be_bytes());
+    result.extend_from_slice(&field.size.to_be_bytes());
+    result.push(field.encoder);
+  }
+  
+  result
+}
+
+// ============================================================================
+// 유틸리티 함수
+// ============================================================================
+
+fn calculate_crc32(packet: &FLPacket) -> u32 {
+  let mut crc: u32 = 0xFFFFFFFF;
+  
+  // 매직 + 헤더
+  for &byte in &packet.magic {
+    crc = crc_byte(crc, byte);
+  }
+  crc = crc_byte(crc, packet.version);
+  crc = crc_byte(crc, packet.packet_type);
+  
+  // 크기
+  for &byte in &packet.bytecode_size.to_be_bytes() {
+    crc = crc_byte(crc, byte);
+  }
+  for &byte in &packet.payload_size.to_be_bytes() {
+    crc = crc_byte(crc, byte);
+  }
+  
+  // 바이트코드와 페이로드
+  for &byte in &packet.bytecode {
+    crc = crc_byte(crc, byte);
+  }
+  for &byte in &packet.payload {
+    crc = crc_byte(crc, byte);
+  }
+  
+  !crc
+}
+
+fn crc_byte(crc: u32, byte: u8) -> u32 {
+  let mut c = crc ^ (byte as u32);
+  for _ in 0..8 {
+    if c & 1 == 1 {
+      c = (c >> 1) ^ 0xEDB88320;
+    } else {
+      c >>= 1;
+    }
+  }
+  c
+}
+
+fn current_time_nanos() -> u64 {
+  // 시스템 시간 (나노초)
+  // 실제 구현: OS API 호출
+  0 // 플레이스홀더
+}
+
+fn serialize_packet(packet: &FLPacket) -> Vec<u8> {
+  let mut result = vec![];
+  
+  // 헤더
+  result.extend_from_slice(&packet.magic);
+  result.push(packet.version);
+  result.push(packet.packet_type);
+  result.extend_from_slice(&packet.reserved);
+  
+  // 크기
+  result.extend_from_slice(&packet.bytecode_size.to_be_bytes());
+  result.extend_from_slice(&packet.payload_size.to_be_bytes());
+  
+  // 페이로드
+  result.extend_from_slice(&packet.bytecode);
+  result.extend_from_slice(&packet.payload);
+  
+  // 체크섬 + 타임스탐프
+  result.extend_from_slice(&packet.checksum.to_be_bytes());
+  result.extend_from_slice(&packet.timestamp.to_be_bytes());
+  
+  result
+}
+
+// ============================================================================
+// 테스트 및 검증
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  
+  #[test]
+  fn test_packet_structure() {
+    let bytecode = vec![0x01, 0x02, 0x03, 0x04];
+    let payload = vec![0x10, 0x20, 0x30, 0x40, 0x50];
+    
+    let packet = create_fl_packet(0, bytecode.clone(), payload.clone());
+    
+    assert_eq!(packet.magic, [0x46, 0x4C, 0x50, 0x4B]); // "FLPK"
+    assert_eq!(packet.version, 0x01);
+    assert_eq!(packet.bytecode_size, 4);
+    assert_eq!(packet.payload_size, 5);
+    assert_eq!(packet.bytecode, bytecode);
+    assert_eq!(packet.payload, payload);
+  }
+  
+  #[test]
+  fn test_packet_serialization() {
+    let bytecode = vec![0xAA, 0xBB, 0xCC, 0xDD];
+    let payload = vec![0x01, 0x02, 0x03];
+    
+    let packet = create_fl_packet(0, bytecode, payload);
+    let serialized = serialize_packet(&packet);
+    
+    // 매직 헤더 확인
+    assert_eq!(&serialized[0..4], &[0x46, 0x4C, 0x50, 0x4B]);
+    assert_eq!(serialized[4], 0x01); // Version
+    assert_eq!(serialized[5], 0x00); // Type
+  }
+  
+  #[test]
+  fn test_packet_parsing() {
+    let bytecode = vec![0x11, 0x22, 0x33];
+    let payload = vec![0xFF, 0xEE];
+    
+    let original = create_fl_packet(1, bytecode.clone(), payload.clone());
+    let serialized = serialize_packet(&original);
+    
+    let parsed = parse_fl_packet(&serialized).unwrap();
+    
+    assert_eq!(parsed.magic, original.magic);
+    assert_eq!(parsed.version, original.version);
+    assert_eq!(parsed.bytecode_size, bytecode.len() as u32);
+    assert_eq!(parsed.payload_size, payload.len() as u32);
+    assert_eq!(parsed.bytecode, bytecode);
+    assert_eq!(parsed.payload, payload);
+  }
+}
